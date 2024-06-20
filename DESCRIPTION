@@ -1,4 +1,4 @@
-Package: did2s
+Package: dr_did2s
 Title: Two-Stage Difference-in-Differences Following Gardner (2021)
 Version: 1.1.0
 Authors@R: 
