@@ -326,7 +326,7 @@ did2s_estimate <- function(data,
 		)
 
 		# Fitted values (should be smaller than 1)
-		e_hat  <- as.vector(e_mod$fitted.values)
+		e_hat  <- predict(e_mod, newdata = data)
 		e_hat  <- pmin(e_hat, 1 - 1e-16)
 
 		# Weight treated and control
