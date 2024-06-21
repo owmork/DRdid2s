@@ -90,9 +90,9 @@
 #' ```
 #'
 #' @export
-did2s <- function(data, yname, first_stage, second_stage, treatment, cluster_var,
-                  weights = NULL, bootstrap = FALSE, n_bootstraps = 250,
-                  return_bootstrap = FALSE, verbose = TRUE) {
+did2s <- function(data, yname, first_stage, second_stage, exposure_stage = NULL,
+				  treatment, cluster_var, weights = NULL, bootstrap = FALSE,
+				  n_bootstraps = 250, return_bootstrap = FALSE, verbose = TRUE) {
 
   # Check Parameters ---------------------------------------------------------
 
@@ -136,6 +136,7 @@ did2s <- function(data, yname, first_stage, second_stage, treatment, cluster_var
     yname = yname,
     first_stage = first_stage,
     second_stage = second_stage,
+    exposure_stage = exposure_stage,
     treatment = treatment,
     weights = weights,
     bootstrap = bootstrap
@@ -204,15 +205,15 @@ did2s <- function(data, yname, first_stage, second_stage, treatment, cluster_var
       x10_g = x10[in_cl, , drop = FALSE]
       first_u_g = first_u[in_cl]
       second_u_g = second_u[in_cl]
-      
+
       # W_g = X_2g u_2g - V X_1g u_1g
-      W_g = Matrix::crossprod(x2_g, second_u_g) - 
+      W_g = Matrix::crossprod(x2_g, second_u_g) -
           V %*% Matrix::crossprod(x10_g, first_u_g)
 
       # Bread x Scores: (X_2'X_2)^-1 W_g
-      # VCOV = \sum_g (X_2'X_2)^-1 W_g W_g' (X_2'X_2)^-1 
+      # VCOV = \sum_g (X_2'X_2)^-1 W_g W_g' (X_2'X_2)^-1
       cov_g = Matrix::tcrossprod(Matrix::solve(tx2x2, W_g))
-      if(i == 1) { 
+      if(i == 1) {
         cov = cov_g
       } else {
         cov = cov + cov_g
@@ -280,63 +281,93 @@ did2s <- function(data, yname, first_stage, second_stage, treatment, cluster_var
 
 
 # Point estimate for did2s
-did2s_estimate <- function(data, yname, first_stage, second_stage, treatment,
-                           weights = NULL, bootstrap = FALSE) {
-  ## We'll use fixest's formula expansion macros to swap out first and second
-  ## stages (see: ?fixest::xpd)
-  fixest::setFixest_fml(
-    ..first_stage = first_stage,
-    ..second_stage = second_stage
-  )
+did2s_estimate <- function(data,
+						   yname,
+						   first_stage,
+						   second_stage,
+						   exposure_stage,
+						   treatment,
+						   weights = NULL,
+						   bootstrap = FALSE) {
+	## We'll use fixest's formula expansion macros to swap out first and second
+	## stages (see: ?fixest::xpd)
+	fixest::setFixest_fml(..first_stage = first_stage, ..second_stage = second_stage)
 
+	# First stage among untreated
+	untreat <- data[data[[treatment]] == 0, ]
+	if (is.null(weights)) {
+		weights_vector <- NULL
+	} else {
+		weights_vector <- untreat[[weights]]
+	}
 
-  # First stage among untreated
-  untreat <- data[data[[treatment]] == 0, ]
-  if (is.null(weights)) {
-    weights_vector <- NULL
-  } else {
-    weights_vector <- untreat[[weights]]
-  }
+	first_stage <- fixest::feols(
+		fixest::xpd(~ 0 + ..first_stage, lhs = yname),
+		data = untreat,
+		weights = weights_vector,
+		combine.quick = FALSE,
+		# allows var1^var2 in FEs
+		warn = FALSE,
+		notes = FALSE
+	)
 
-  first_stage <- fixest::feols(fixest::xpd(~ 0 + ..first_stage, lhs = yname),
-    data = untreat,
-    weights = weights_vector,
-    combine.quick = FALSE, # allows var1^var2 in FEs
-    warn = FALSE,
-    notes = FALSE
-  )
+	# Residualized outcome
+	first_u <- data[[yname]] - stats::predict(first_stage, newdata = data)
 
-  # Residualize outcome variable but keep same yname
-  first_u <- data[[yname]] - stats::predict(first_stage, newdata = data)
-  data[[yname]] <- first_u
+	if (!is.null(exposure_stage)) {
+		fixest::setFixest_fml(..exposure_stage = exposure_stage)
+		# Exposure stage
+		e_mod <- fixest::feglm(
+			fixest::xpd(~ ..exposure_stage, lhs = treatment),
+			data = data,
+			weights = weights_vector,
+			warn = FALSE,
+			notes = FALSE
+		)
 
-  # Zero out residual rows with D_it = 1 (for analytical SEs later on)
-  if (!bootstrap) first_u[data[[treatment]] == 1] <- 0
+		# Fitted values (should be smaller than 1)
+		e_hat  <- as.vector(e_mod$fitted.values)
+		e_hat  <- pmin(e_hat, 1 - 1e-16)
 
-  # Second stage
-  if (!is.null(weights)) weights_vector <- data[[weights]]
+		# Weight treated and control
+		D <- as.vector(data[[treatment]])
+		w_treat <- as.numeric(D)
+		w_cont <- e_hat * (1 - D) / (1 - e_hat)
 
-  second_stage <- fixest::feols(fixest::xpd(~ 0 + ..second_stage, lhs = yname),
-    data = data,
-    weights = weights_vector,
-    warn = FALSE,
-    notes = FALSE
-  )
+		# Doubly robust pseudo outcome
+		first_u <- (w_treat - w_cont) * first_u
+	}
 
-  ret <- list(
-    first_stage = first_stage,
-    second_stage = second_stage
-  )
+	# Residualize outcome variable but keep same yname
+	data[[yname]] <- first_u
 
-  if (!bootstrap) {
-    ret <- list(
-      first_stage = first_stage,
-      second_stage = second_stage,
-      first_u = first_u
-    )
-  } else {
-    ret <- list(second_stage = second_stage)
-  }
+	# Zero out residual rows with D_it = 1 (for analytical SEs later on)
+	if (!bootstrap)
+		first_u[data[[treatment]] == 1] <- 0
 
-  return(ret)
+	# Second stage
+	if (!is.null(weights))
+		weights_vector <- data[[weights]]
+
+	second_stage <- fixest::feols(
+		fixest::xpd(~ ..second_stage, lhs = yname),
+		data = data,
+		weights = weights_vector,
+		warn = FALSE,
+		notes = FALSE
+	)
+
+	ret <- list(first_stage = first_stage, second_stage = second_stage)
+
+	if (!bootstrap) {
+		ret <- list(
+			first_stage = first_stage,
+			second_stage = second_stage,
+			first_u = first_u
+		)
+	} else {
+		ret <- list(second_stage = second_stage)
+	}
+
+	return(ret)
 }
